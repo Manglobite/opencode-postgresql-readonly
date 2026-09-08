@@ -1,0 +1,17 @@
+{
+  "projects": {
+    "example-db": {
+      "dev": {
+        "driver": "postgres",
+        "host": "db.example.invalid",
+        "port": 5432,
+        "database": "exampledb",
+        "sslmode": "prefer",
+        "auth": {
+          "user": "reader",
+          "password": "replace_with_real_password"
+        }
+      }
+    }
+  }
+}
