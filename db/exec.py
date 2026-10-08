@@ -1,378 +1,256 @@
 #!/usr/bin/env python3
-"""
-PostgreSQL read-only query executor.
-Uses psycopg2 with server-enforced READ ONLY transaction.
-"""
+import datetime
+import decimal
 import json
-import re
 import sys
+import uuid
 
 import psycopg2
+from pglast import ast, parse_sql
+from pglast.stream import RawStream
+from pglast.visitors import Visitor
 
 
-ALLOWED_FIRST_KEYWORDS = {"SELECT", "WITH", "EXPLAIN"}
-DISALLOWED_KEYWORDS = {
-    "ALTER",
-    "ANALYZE",
-    "CALL",
-    "COPY",
-    "CREATE",
-    "DELETE",
-    "DISCARD",
-    "DROP",
-    "EXECUTE",
-    "GRANT",
-    "INSERT",
-    "LISTEN",
-    "LOCK",
-    "NOTIFY",
-    "REINDEX",
-    "REVOKE",
-    "TRUNCATE",
-    "UNLISTEN",
-    "UPDATE",
-    "VACUUM",
-}
-SYSTEM_SCHEMAS = {"pg_catalog", "information_schema", "pg_toast", "pg_temp"}
 MAX_QUERY_LENGTH = 10000
-
-FORBIDDEN_FUNCTIONS = [
-    "pg_terminate_backend",
-    "pg_cancel_backend",
-    "pg_reload_conf",
-    "pg_rotate_logfile",
-    "pg_read_file",
-    "pg_read_binary_file",
-    "pg_ls_dir",
-    "pg_stat_file",
-    "pg_logdir_ls",
-    "pg_advisory_lock",
-    "pg_advisory_lock_shared",
-    "pg_advisory_xact_lock",
-    "pg_advisory_xact_lock_shared",
-    "pg_advisory_unlock",
-    "pg_advisory_unlock_shared",
-    "pg_advisory_unlock_all",
-    "pg_sleep",
-    "pg_sleep_for",
-    "pg_sleep_until",
-    "lo_import",
-    "lo_export",
-    "lo_create",
-    "lo_unlink",
-    "lo_open",
-    "lo_close",
-    "lo_read",
-    "lo_write",
-    "lo_lseek",
-    "lo_tell",
-    "lo_truncate",
-    "set_config",
-    "current_setting",
-    "pg_current_logfile",
-    "dblink_connect",
-    "dblink_connect_u",
-    "dblink_disconnect",
-    "dblink",
-    "pg_export_snapshot",
-    "pg_create_restore_point",
-    "pg_switch_wal",
-    "pg_promote",
-    "pg_log_backend_memory_contexts",
-]
+MAX_ROWS = 1000
+MAX_RESULT_BYTES = 1024 * 1024
+ALLOWED_FUNCTIONS = frozenset({
+    "count", "sum", "avg", "min", "max", "bool_and", "bool_or", "every",
+    "abs", "ceil", "ceiling", "floor", "round", "trunc", "mod", "sqrt",
+    "lower", "upper", "length", "char_length", "octet_length", "trim",
+    "btrim", "ltrim", "rtrim", "substring", "substr", "replace", "concat",
+    "concat_ws", "left", "right", "strpos", "split_part", "starts_with",
+    "date_trunc", "date_part", "extract", "age", "now", "to_char",
+    "row_number", "rank", "dense_rank", "lag", "lead", "first_value",
+    "last_value", "nth_value", "ntile", "percent_rank", "cume_dist",
+})
+ALLOWED_TYPES = frozenset({
+    "bool", "boolean", "int2", "int4", "int8", "smallint", "integer",
+    "bigint", "numeric", "decimal", "float4", "float8", "real", "text",
+    "varchar", "bpchar", "date", "time", "timetz", "timestamp",
+    "timestamptz", "interval", "uuid", "json", "jsonb", "bytea",
+})
+ALLOWED_OPERATORS = frozenset({
+    "=", "<>", "!=", "<", ">", "<=", ">=", "+", "-", "*", "/", "%",
+    "^", "||", "~~", "!~~", "~~*", "!~~*", "~", "!~", "~*", "!~*",
+    "->", "->>", "#>", "#>>", "@>", "<@", "?", "?|", "?&",
+})
+ALLOWED_NODES = frozenset({
+    "SelectStmt", "ResTarget", "ColumnRef", "A_Star", "A_Const", "String",
+    "Integer", "Float", "Boolean", "BitString", "RangeVar", "Alias",
+    "JoinExpr", "RangeSubselect", "WithClause", "CommonTableExpr", "SubLink",
+    "A_Expr", "BoolExpr", "NullTest", "BooleanTest", "FuncCall", "TypeCast",
+    "TypeName", "CoalesceExpr", "MinMaxExpr", "CaseExpr", "CaseWhen",
+    "SortBy", "WindowDef", "SQLValueFunction", "RowExpr", "A_ArrayExpr",
+    "A_Indirection", "A_Indices", "GroupingSet", "GroupingFunc",
+})
 
 
 class SqlToolError(Exception):
     pass
 
 
-def load_request() -> tuple[str, dict]:
+def load_request() -> tuple[str, dict, str]:
     try:
         payload = json.load(sys.stdin)
     except json.JSONDecodeError as exc:
-        raise SqlToolError(f"Invalid JSON input: {exc}") from exc
-
+        raise SqlToolError("Invalid JSON input") from exc
+    if not isinstance(payload, dict):
+        raise SqlToolError("Input must be an object")
     query = payload.get("query")
     config = payload.get("config")
-
+    operation = payload.get("operation", "query")
+    if operation not in {"query", "schema"}:
+        raise SqlToolError("Unsupported operation")
+    if operation == "schema":
+        if "query" in payload:
+            raise SqlToolError("Schema discovery does not accept SQL")
+        query = "__schema__"
     if not isinstance(query, str) or not query.strip():
         raise SqlToolError("The 'query' field must be a non-empty string.")
     if not isinstance(config, dict):
         raise SqlToolError("The 'config' field must be an object.")
-
     required_keys = ["host", "port", "database", "user", "password"]
-    missing = [key for key in required_keys if key not in config]
-    if missing:
-        raise SqlToolError(f"Missing config keys: {', '.join(missing)}")
-
-    return query, config
+    if any(key not in config for key in required_keys):
+        raise SqlToolError("Missing database configuration fields")
+    return query, config, operation
 
 
-def is_identifier_char(char: str) -> bool:
-    return char.isalnum() or char in {"_", "$"}
+def normalized_ast(value):
+    if isinstance(value, (list, tuple)):
+        return [normalized_ast(item) for item in value]
+    if isinstance(value, dict):
+        if "#" in value:
+            return value["name"]
+        fields = {key: normalized_ast(item) for key, item in value.items() if key != "@" and item is not None}
+        return {value["@"]: fields} if "@" in value else fields
+    return value
 
 
-def remove_comments_and_strings(sql: str) -> str:
-    result: list[str] = []
-    i = 0
-    length = len(sql)
-    block_comment_depth = 0
-    dollar_tag: str | None = None
-
-    while i < length:
-        if dollar_tag is not None:
-            if sql.startswith(dollar_tag, i):
-                result.append(" ")
-                i += len(dollar_tag)
-                dollar_tag = None
-            else:
-                i += 1
-            continue
-
-        if block_comment_depth > 0:
-            if sql.startswith("/*", i):
-                block_comment_depth += 1
-                i += 2
-            elif sql.startswith("*/", i):
-                block_comment_depth -= 1
-                i += 2
-            else:
-                i += 1
-            continue
-
-        if sql.startswith("--", i):
-            while i < length and sql[i] != "\n":
-                i += 1
-            result.append("\n")
-            continue
-
-        if sql.startswith("/*", i):
-            block_comment_depth = 1
-            i += 2
-            continue
-
-        if sql[i] == "'":
-            i += 1
-            while i < length:
-                if sql[i] == "'":
-                    if i + 1 < length and sql[i + 1] == "'":
-                        i += 2
-                        continue
-                    i += 1
-                    break
-                i += 1
-            result.append(" ")
-            continue
-
-        if sql[i] == '"':
-            i += 1
-            while i < length:
-                if sql[i] == '"':
-                    if i + 1 < length and sql[i + 1] == '"':
-                        i += 2
-                        continue
-                    i += 1
-                    break
-                i += 1
-            result.append(" ")
-            continue
-
-        if sql[i] == "$":
-            match = re.match(r"\$[A-Za-z_][A-Za-z0-9_]*\$|\$\$", sql[i:])
-            if match:
-                dollar_tag = match.group(0)
-                result.append(" ")
-                i += len(dollar_tag)
-                continue
-
-        result.append(sql[i])
-        i += 1
-
-    if block_comment_depth > 0:
-        raise SqlToolError("Unterminated block comment in SQL query.")
-    if dollar_tag is not None:
-        raise SqlToolError("Unterminated dollar-quoted string in SQL query.")
-
-    return "".join(result)
+def names(items: list) -> list[str]:
+    return [item["String"]["sval"] for item in items]
 
 
-def split_top_level_statements(sql: str) -> list[str]:
-    statements: list[str] = []
-    current: list[str] = []
-    depth = 0
+def check_ast(value) -> None:
+    if isinstance(value, list):
+        for item in value:
+            check_ast(item)
+        return
+    if not isinstance(value, dict):
+        return
+    for key, node in value.items():
+        if key[:1].isupper():
+            if key not in ALLOWED_NODES:
+                raise SqlToolError(f"Unsupported SQL construct: {key}")
+            if key == "SelectStmt" and (node.get("intoClause") or node.get("lockingClause")):
+                raise SqlToolError("SELECT INTO and row locking are not allowed")
+            if key == "RangeVar":
+                if node.get("catalogname") or node.get("schemaname") not in {None, "public"}:
+                    raise SqlToolError("Only the public application schema is allowed")
+                if node["relname"].lower().startswith("pg_"):
+                    raise SqlToolError("System objects are not allowed")
+            if key == "FuncCall":
+                function = names(node["funcname"])
+                if not function or function[-1] not in ALLOWED_FUNCTIONS or (
+                    len(function) != 1 and not (len(function) == 2 and function[0] == "pg_catalog")
+                ):
+                    raise SqlToolError("Function is not in the allowed built-in function list")
+            if key == "TypeName":
+                typename = names(node.get("names", []))
+                if not typename or typename[-1] not in ALLOWED_TYPES or (
+                    len(typename) != 1 and not (len(typename) == 2 and typename[0] == "pg_catalog")
+                ):
+                    raise SqlToolError("Only built-in types are allowed")
+            if key == "A_Expr":
+                operators = names(node.get("name", []))
+                allowed = ALLOWED_OPERATORS | {"BETWEEN", "NOT BETWEEN", "BETWEEN SYMMETRIC", "NOT BETWEEN SYMMETRIC"}
+                if operators and (len(operators) != 1 or operators[0] not in allowed):
+                    raise SqlToolError("Operator is not allowed")
+            if key == "SortBy" and node.get("useOp"):
+                raise SqlToolError("Custom sort operators are not allowed")
+            if key == "WithClause" and node.get("recursive"):
+                raise SqlToolError("Recursive CTEs are not supported")
+        check_ast(node)
 
-    for char in sql:
-        if char == "(":
-            depth += 1
-        elif char == ")" and depth > 0:
-            depth -= 1
-        elif char == ";" and depth == 0:
-            statement = "".join(current).strip()
-            if statement:
-                statements.append(statement)
-            current = []
-            continue
-        current.append(char)
 
-    tail = "".join(current).strip()
-    if tail:
-        statements.append(tail)
+class QualifyBuiltins(Visitor):
+    def visit_FuncCall(self, ancestors, node):
+        if len(node.funcname) == 1:
+            node.funcname = (ast.String(sval="pg_catalog"), *node.funcname)
 
-    return statements
-
-
-def extract_words(sql: str) -> list[str]:
-    words: list[str] = []
-    current: list[str] = []
-
-    for char in sql:
-        if is_identifier_char(char):
-            current.append(char)
-            continue
-        if current:
-            words.append("".join(current).upper())
-            current = []
-
-    if current:
-        words.append("".join(current).upper())
-
-    return words
+    def visit_TypeName(self, ancestors, node):
+        if len(node.names) == 1:
+            node.names = (ast.String(sval="pg_catalog"), *node.names)
 
 
 def validate_query(query: str) -> str:
-    normalized = query.strip()
-    if not normalized:
-        raise SqlToolError("SQL query is empty.")
-
-    if len(normalized) > MAX_QUERY_LENGTH:
-        raise SqlToolError("Query length exceeds 10000 characters.")
-
-    stripped = remove_comments_and_strings(normalized)
-
-    if "\\" in stripped:
-        raise SqlToolError("Query contains invalid characters (backslash).")
-
-    # Check for unquoted system schema references in cleaned SQL
-    for schema in SYSTEM_SCHEMAS:
-        pattern = re.compile(
-            r"(?<![A-Za-z0-9_])" + re.escape(schema) + r"(?![A-Za-z0-9_])",
-            re.IGNORECASE,
-        )
-        if pattern.search(stripped):
-            raise SqlToolError(f"Access to system schema '{schema}' is not allowed.")
-
-    # Check for quoted system schema references in original SQL
-    for schema in SYSTEM_SCHEMAS:
-        pattern = re.compile(
-            r'"\s*' + re.escape(schema) + r'\s*"',
-            re.IGNORECASE,
-        )
-        if pattern.search(normalized):
-            raise SqlToolError(f"Access to system schema '{schema}' is not allowed.")
-
-    for func in FORBIDDEN_FUNCTIONS:
-        pattern = re.compile(
-            r'(?<![A-Za-z0-9_])' + re.escape(func) + r'\s*\(',
-            re.IGNORECASE,
-        )
-        if pattern.search(stripped):
-            raise SqlToolError(f"Function '{func}' is not allowed in read-only mode")
-
-    # Check for quoted pg_* identifiers in original SQL
-    if re.search(r'"\s*pg_[A-Za-z0-9_]*\s*"', normalized, re.IGNORECASE):
-        raise SqlToolError("Access to system objects (pg_*) is not allowed")
-
-    # Check for quoted forbidden functions in original SQL
-    for func in FORBIDDEN_FUNCTIONS:
-        pattern = re.compile(
-            r'"\s*' + re.escape(func) + r'\s*"\s*\(',
-            re.IGNORECASE,
-        )
-        if pattern.search(normalized):
-            raise SqlToolError(f"Function '{func}' is not allowed in read-only mode")
-
-    statements = split_top_level_statements(stripped)
-
-    if not statements:
-        raise SqlToolError("SQL query is empty after removing comments.")
-    if len(statements) != 1:
-        raise SqlToolError("Only a single SQL statement is allowed.")
-
-    statement = statements[0]
-    words = extract_words(statement)
-    if not words:
-        raise SqlToolError("Could not detect a SQL statement.")
-
-    # Block all pg_* prefixed identifiers (system catalog objects)
-    for word in words:
-        if word.startswith("PG_"):
-            raise SqlToolError(
-                f"Access to system objects (pg_*) is not allowed: '{word}'"
-            )
-
-    first_keyword = words[0]
-    if first_keyword not in ALLOWED_FIRST_KEYWORDS:
-        raise SqlToolError(
-            f"Only {'/'.join(sorted(ALLOWED_FIRST_KEYWORDS))} queries are allowed."
-        )
-
-    dangerous = sorted({word for word in words if word in DISALLOWED_KEYWORDS})
-    if dangerous:
-        raise SqlToolError(
-            "Only read-only queries are allowed. Disallowed keywords found: "
-            + ", ".join(dangerous)
-        )
-
-    # Check for quoted disallowed keywords in original SQL
-    for kw in DISALLOWED_KEYWORDS:
-        pattern = re.compile(
-            r'"\s*' + re.escape(kw) + r'\s*"',
-            re.IGNORECASE,
-        )
-        if pattern.search(normalized):
-            raise SqlToolError(
-                "Only read-only queries are allowed. Disallowed keyword found: " + kw
-            )
-
-    return normalized.rstrip().rstrip(";")
+    if not isinstance(query, str) or not query.strip():
+        raise SqlToolError("SQL query is empty")
+    if len(query) > MAX_QUERY_LENGTH:
+        raise SqlToolError("Query length exceeds 10000 characters")
+    try:
+        tree = parse_sql(query)
+        if len(tree) != 1 or not isinstance(tree[0].stmt, ast.SelectStmt):
+            raise SqlToolError("Only a single SELECT or read-only WITH statement is allowed")
+        check_ast(normalized_ast(tree[0].stmt()))
+        QualifyBuiltins()(tree)
+        return RawStream()(tree)
+    except SqlToolError:
+        raise
+    except Exception as exc:
+        raise SqlToolError("Invalid or unsupported SQL") from exc
 
 
-def execute_query(config: dict, query: str) -> dict:
+def json_value(value):
+    if isinstance(value, (datetime.date, datetime.time, datetime.timedelta, decimal.Decimal, uuid.UUID)):
+        return str(value)
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return bytes(value).hex()
+    raise TypeError("Unsupported result type")
+
+
+def encode_result(result: dict) -> str:
+    return json.dumps(result, ensure_ascii=True, default=json_value, separators=(",", ":"))
+
+
+def bounded_result(cur, schema: bool = False) -> dict:
+    result = {
+        "columns": [desc[0] for desc in cur.description],
+        "rows": [], "row_count": 0, "truncated": False,
+    }
+    if schema:
+        result["schema"] = "public"
+    reserved = len(encode_result(result).encode("utf-8")) + 32
+    if reserved > MAX_RESULT_BYTES:
+        raise SqlToolError("Result column metadata exceeds the output limit")
+    size = reserved
+    for _ in range(MAX_ROWS + 1):
+        row = cur.fetchone()
+        if row is None:
+            break
+        if len(result["rows"]) == MAX_ROWS:
+            result["truncated"] = True
+            break
+        row = list(row)
+        row_size = len(encode_result(row).encode("utf-8")) + 1
+        if size + row_size > MAX_RESULT_BYTES:
+            result["truncated"] = True
+            break
+        result["rows"].append(row)
+        size += row_size
+    result["row_count"] = len(result["rows"])
+    return result
+
+
+SCHEMA_QUERY = """
+SELECT c.table_schema, c.table_name, t.table_type,
+       c.column_name, c.data_type, c.udt_name,
+       c.is_nullable, c.ordinal_position
+FROM information_schema.columns AS c
+JOIN information_schema.tables AS t
+  ON t.table_schema = c.table_schema AND t.table_name = c.table_name
+WHERE c.table_schema = %s
+ORDER BY c.table_name, c.ordinal_position
+LIMIT 1001
+"""
+
+
+def execute_query(config: dict, query: str, operation: str = "query") -> dict:
+    if operation not in {"query", "schema"}:
+        raise SqlToolError("Unsupported operation")
+    schema = operation == "schema"
+    safe_query = None if schema else validate_query(query)
     conn = None
     try:
         try:
             conn = psycopg2.connect(
-                host=config["host"],
-                port=config["port"],
-                dbname=config["database"],
-                user=config["user"],
-                password=config["password"],
-                sslmode=config.get("sslmode", "prefer"),
-                options="-c search_path=public,pg_catalog -c default_transaction_read_only=on",
+                host=config["host"], port=config["port"], dbname=config["database"],
+                user=config["user"], password=config["password"],
+                sslmode=config.get("sslmode", "prefer"), connect_timeout=5,
+                options="-c search_path=pg_catalog,public -c default_transaction_read_only=on "
+                        "-c statement_timeout=10000 -c lock_timeout=1000 "
+                        "-c idle_in_transaction_session_timeout=15000",
             )
             conn.set_session(readonly=True, autocommit=False)
-        except psycopg2.OperationalError:
-            raise SqlToolError("Connection refused or invalid credentials")
-
+        except psycopg2.OperationalError as exc:
+            raise SqlToolError("Connection refused or invalid credentials") from exc
         try:
             with conn.cursor() as cur:
-                cur.execute("SET search_path = 'public'")
-                cur.execute(query)
-                if cur.description:
-                    columns = [desc[0] for desc in cur.description]
-                    rows = [list(row) for row in cur.fetchall()]
-                    row_count = len(rows)
+                cur.execute("SET LOCAL search_path = pg_catalog, public")
+                cur.execute("SET LOCAL statement_timeout = '10s'")
+                cur.execute("SET LOCAL lock_timeout = '1s'")
+            with conn.cursor(name="readonly_result") as cur:
+                cur.itersize = 1
+                if schema:
+                    cur.execute(SCHEMA_QUERY, ("public",))
                 else:
-                    columns = []
-                    rows = []
-                    row_count = 0
-        except psycopg2.Error as e:
-            raise SqlToolError("Query execution failed")
-
-        return {"columns": columns, "rows": rows, "row_count": row_count}
-
+                    cur.execute(f"SELECT * FROM ({safe_query}) AS readonly_result LIMIT {MAX_ROWS + 1}")
+                first = cur.fetchone()
+                return bounded_result(PrefetchedCursor(cur, first), schema)
+        except psycopg2.Error as exc:
+            raise SqlToolError("Query execution failed or exceeded its time limit") from exc
     finally:
-        if conn:
+        if conn is not None:
             try:
                 conn.rollback()
             except Exception:
@@ -383,21 +261,29 @@ def execute_query(config: dict, query: str) -> dict:
                 pass
 
 
+class PrefetchedCursor:
+    def __init__(self, cursor, first):
+        self.cursor = cursor
+        self.description = cursor.description
+        self.first = first
+        self.pending = True
+
+    def fetchone(self):
+        if self.pending:
+            self.pending = False
+            return self.first
+        return self.cursor.fetchone()
+
+
 def main() -> None:
     try:
-        query, config = load_request()
-        safe_query = validate_query(query)
-        result = execute_query(config, safe_query)
-        print(json.dumps(result))
+        query, config, operation = load_request()
+        result = execute_query(config, query, operation)
+        print(encode_result(result))
     except SqlToolError as exc:
-        error_msg = str(exc)
-        if "Connection refused" in error_msg or "invalid credentials" in error_msg:
-            output = {"error": "Connection failed", "reason": error_msg}
-        else:
-            output = {"error": "Query execution failed", "reason": error_msg}
-        print(json.dumps(output))
+        print(encode_result({"error": "Query execution failed", "reason": str(exc)}))
     except Exception:
-        print(json.dumps({"error": "Unexpected error", "reason": "An unexpected internal error occurred"}))
+        print(encode_result({"error": "Unexpected error", "reason": "An unexpected internal error occurred"}))
 
 
 if __name__ == "__main__":

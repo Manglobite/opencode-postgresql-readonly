@@ -1,4 +1,7 @@
 node_modules/
+.deps/
+.venv/
+.ruff_cache/
 config.json
 .env
 .env.*
