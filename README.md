@@ -2,12 +2,13 @@
 
 [Русский](README.ru.md) · **English**
 
-Read-only PostgreSQL tools for OpenCode: safe `SELECT`-style queries and a
-listing of the configured projects/environments.
+Read-only PostgreSQL tools for OpenCode: restricted `SELECT` queries, schema
+metadata and a listing of configured projects/environments for trusted databases.
 
 ## Features
 
-- **`database_exec`** — run a read-only SQL query against PostgreSQL.
+- **`database_exec`** — run a restricted read-only SQL query against PostgreSQL.
+- **`database_schema`** — read table/column metadata for `public`, without arbitrary SQL or row data (up to 1,000 columns).
 - **`database_list`** — list the configured database projects and their
   environments.
 
@@ -28,13 +29,15 @@ cp -r database.ts config.ts config.example.json db requirements.txt \
   ~/.config/opencode/tools/opencode-postgres-readonly/
 ```
 
-Then install the Python dependency:
+Install both Python dependencies in the installation directory (Python 3.10+):
 
 ```bash
-pip install -r requirements.txt
-# or
-pip install "psycopg2-binary>=2.9"
+cd ~/.config/opencode/tools/opencode-postgres-readonly
+python3 -m venv .venv
+.venv/bin/python -m pip install -r requirements.txt
 ```
+
+The tool uses its adjacent `.venv/bin/python` when available, otherwise `python3`. Bun and the OpenCode plugin API must be available in the host environment. For a standalone checkout, install JS dependencies from its own `package.json`, never from a directory without a local manifest.
 
 ### Create the local configuration
 
@@ -118,7 +121,8 @@ Successful response:
 {
   "columns": ["id", "name"],
   "rows": [[1, "Product A"], [2, "Product B"]],
-  "row_count": 2
+  "row_count": 2,
+  "truncated": false
 }
 ```
 
@@ -126,7 +130,7 @@ Errors:
 
 ```json
 {"error": "Query execution failed", "reason": "..."}
-{"error": "Connection failed", "reason": "..."}
+{"error": "Unexpected error", "reason": "An unexpected internal error occurred"}
 ```
 
 ### database_list
@@ -147,21 +151,61 @@ Response:
 
 ## Security and limits
 
-- Only `SELECT`, `WITH`, and `EXPLAIN` are allowed as the first keyword.
-- All DDL/DML is blocked (`CREATE`, `DROP`, `INSERT`, `UPDATE`, `DELETE`, and
-  more).
-- System schemas are blocked (`pg_catalog`, `information_schema`, `pg_toast`,
-  `pg_temp`).
-- Dangerous functions are blocked (`pg_terminate_backend`, `pg_sleep`,
-  `lo_*`, `dblink`, and more).
-- All `pg_*`-prefixed identifiers are blocked.
-- A server-side `READ ONLY` transaction is used.
-- `search_path` is forced to `public`.
-- Error messages are masked — the real cause does not leak to stdout.
-- Maximum query length is 10 000 characters.
-- Only a single SQL statement is allowed.
-- Backslashes are rejected.
-- Credentials are stored only in the local `config.json` (not committed).
+- PostgreSQL AST validation via `pglast`: one SELECT, including nonrecursive read-only CTEs. Unknown constructs fail closed; EXPLAIN, writes, transaction commands, SELECT INTO and row locking are rejected.
+- Explicit table schemas must be `public`; system `pg_*` relations are rejected. Schema discovery uses a separate fixed metadata query.
+- Only allowlisted built-in functions and types are accepted and qualified with `pg_catalog`. Custom operator qualification is rejected.
+- Server-side READ ONLY transaction, rollback on completion, and `search_path=pg_catalog,public`.
+- At most 1,000 rows and 1 MiB of serialized JSON per result; `truncated` indicates omitted rows. A server cursor avoids fetching the entire result at once.
+- Connection timeout: 5 seconds; statement timeout: 10 seconds per server command (including cursor fetch); lock timeout: 1 second. The TypeScript worker deadline is 25 seconds overall.
+- Maximum input SQL length: 10,000 characters. Worker and database errors are masked.
+- Install both dependencies from `requirements.txt` in the Python environment used by the tool.
+
+This is not a sandbox for a hostile database schema: views, RLS policies, custom column types, overloaded operators and implicit casts may invoke code indirectly. Use a minimally privileged database role and restrict executable functions; do not grant the agent access to credentials, code modification, or an alternative database client. A single huge field can still consume memory before output truncation. READ ONLY does not undo external side effects.
+
+### Trust boundary
+
+The tool provides restricted reading of a trusted database schema, not a guarantee that arbitrary database code has no side effects. It validates the submitted SQL, not every function hidden behind database objects. READ ONLY blocks ordinary writes in the current transaction even when the account has write privileges; it does not protect other connections, files, or external services.
+
+- Views and row-level security (RLS) policies may call functions indirectly. Custom types, operators and implicit casts can also execute database code.
+- Use a dedicated minimally privileged account in production, not a superuser. The agent must not be able to read credentials, modify this tool or bypass it with another database client.
+- This is not a data-redaction or authorization layer: readable sensitive rows are returned as requested. Limits apply per call; repeated calls can read more data.
+- Timeouts and output limits reduce resource exposure but do not impose a strict database CPU, disk or process-memory quota. A single large field may be allocated before truncation. The 25-second deadline kills the local worker; immediate cancellation of arbitrary external work is not guaranteed.
+- SQL support is intentionally incomplete. Recursive CTEs, EXPLAIN, arbitrary functions, custom explicit types/operators and unsupported AST constructs are rejected. Built-in function/type allowlists live in `db/exec.py`.
+
+### Verification performed
+
+**Local automated checks:** 11 Python unit tests passed, along with ESLint, Ruff, TypeScript type checking and `git diff --check`. Tests cover accepted SQL, rejected constructs, pre-connection validation, row/byte limits, cleanup and schema discovery; database interactions in these tests are mocked.
+
+**Live integration run:** 23 checks passed on PostgreSQL 16.13 in Docker using a superuser account and a separate disposable database. Checked SELECT, CTE/JOIN/aggregation, date/numeric/UUID results, empty results, schema discovery, 1,000-row truncation and the 1 MiB output limit. Statement and lock timeouts were observed at approximately 10 and 1 seconds. Fixture contents remained unchanged after all attack checks; the disposable database was removed.
+
+Attack categories checked (names only):
+
+- Direct DELETE, DROP and TRUNCATE.
+- Multi-statement injection using dollar-sign identifiers and transaction escape.
+- Data-modifying CTE.
+- Quoted-function/comment filter bypass and transaction-setting changes.
+- Unicode system-catalog identifier bypass.
+- Cross-connection write function call.
+- Direct application-function call.
+- Row locking, SELECT INTO and EXPLAIN ANALYZE.
+- Indirect write through a view: rejected by PostgreSQL READ ONLY.
+
+The live run exercised the Python executor, not the complete OpenCode-to-TypeScript path. Direct attack calls were rejected before execution; this does not prove safety of all extension functions. The 25-second TypeScript deadline, connection timeout under network failure, RLS/custom-type/operator side effects, external side effects and other PostgreSQL versions were not integration-tested. The one-off integration harness is not included in the repository; `bun run test` runs only the unit suite. These results are evidence for the tested scenarios, not a security certification.
+
+### Development checks
+
+Run from this repository root, which contains its own `package.json`:
+
+```bash
+python3 -m venv .venv
+.venv/bin/python -m pip install -r requirements-dev.txt
+bun install --frozen-lockfile
+bun run lint
+bun run typecheck
+bun run test
+```
+
+`typecheck` checks TypeScript only. Keep `config.json`, virtual environments, dependency directories and local test data out of commits; publish source and lock files, not a full directory archive.
 
 ## OpenCode permissions
 
@@ -171,6 +215,7 @@ Minimal fragment to allow the tools:
 {
   "$schema": "https://opencode.ai/config.json",
   "permission": {
+    "database_schema": "allow",
     "database_exec": "allow",
     "database_list": "allow"
   }
@@ -188,6 +233,7 @@ For a strict subagent (`"*": "deny"`):
       "description": "Read-only database access.",
       "permission": {
         "*": "deny",
+        "database_schema": "allow",
         "database_exec": "allow",
         "database_list": "allow"
       }
